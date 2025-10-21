@@ -1,0 +1,17 @@
+1- python baixar.py
+
+2- python descompactar.py
+
+3- python gerar_indices_csv.py --xls .\ipca-e_SerieHist\ipca-e_202509SerieHist.xls `
+  --sheet "SÉRIE HISTÓRICA" `
+  --indice "IPCA-E" `
+  --out .\indices.csv `
+  --header-row 3 `
+  --year-col "ANO" `
+  --month-col "MÊS" `
+  --var-col "VARIAÇÃO (%)" `
+  --debug
+
+
+
+4-python .\main.py    

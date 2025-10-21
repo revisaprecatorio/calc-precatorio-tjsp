@@ -1,13 +1,30 @@
-echo "env/
+# --- Python / Windows ---
+env/
+.venv/
+venv/
 __pycache__/
-*.pyc
+*.py[cod]
 *.pyo
 *.pyd
-*.sqlite3
+*.egg-info/
 *.log
-*.env
+
+# IDE / Editor
 .vscode/
 .idea/
-__snapshots__/
-out/
-" > .gitignore
+
+# Credenciais / configs locais
+*.env
+*.env.*
+.envrc
+
+# Dados grandes/temporários
+downloads/
+.ipynb_checkpoints/
+*.tmp
+*.bak
+
+# Mantém planilhas de índice (não ignore!)
+# *.xls
+# *.xlsx
+# ipca-e_SerieHist/
