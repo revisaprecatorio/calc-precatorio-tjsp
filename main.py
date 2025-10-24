@@ -17,6 +17,8 @@ from typing import Optional, Dict, Any
 from dotenv import load_dotenv
 import psycopg2
 from psycopg2.extras import RealDictCursor
+from decimal import Decimal
+
 
 # ---------------------- CONFIG ----------------------
 load_dotenv()
@@ -49,12 +51,24 @@ and process_calculo is false
 
 # ---------------------- HELPERS ---------------------
 def _to_number_str_money(v) -> str:
-    """Para valores monetários: remove milhar (.) e troca vírgula por ponto."""
+    """Aceita Decimal/float/int sem mexer; só converte pt-BR quando houver vírgula."""
     if v is None:
         return "0"
-    s = str(v).strip().replace("R$", "").replace(" ", "")
-    s = s.replace(".", "").replace(",", ".")
-    return s
+    if isinstance(v, (int, float, Decimal)):
+        # retorna como string simples (p/ passar ao CLI do app_4.py)
+        return str(v)
+
+    s = str(v).strip().replace("R$", "").strip()
+
+    # Caso pt-BR: tem vírgula decimal
+    if "," in s:
+        # remove separador de milhar e troca vírgula por ponto
+        s = s.replace(".", "").replace(",", ".")
+    else:
+        # Caso US: mantém ponto decimal, remove lixo
+        s = re.sub(r"[^\d\.\-]", "", s)
+
+    return s or "0"
 
 def _to_number_str_factor(v) -> str:
     """Para fatores: mantém ponto decimal; troca vírgula por ponto (se vier)."""
