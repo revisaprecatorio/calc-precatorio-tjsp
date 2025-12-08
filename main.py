@@ -103,13 +103,13 @@ def main():
             cpf, 
             numero_processo_cnj, 
             valor_total_requisitado AS valor_precatorio,
-            valor_principal_bruto AS principal, 
+            saldo_final AS principal, 
             data_base_atualizacao AS data_requisitorio, 
             juros_moratorios AS juros_mora 
         FROM esaj_detalhe_processos 
         WHERE data_base_atualizacao IS NOT NULL
         AND (process_calculo IS FALSE OR process_calculo IS NULL)
-    """
+    """ ""
     
     cursor.execute(sql_busca)
     processos = cursor.fetchall()
