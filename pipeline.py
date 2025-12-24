@@ -1,129 +1,102 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-"""
-pipeline.py
-
-Executa o fluxo de trabalho completo de pré-processamento:
-1. Baixa IPCA-E (IBGE)
-2. Baixa SELIC (BCB)
-3. Descompacta IPCA-E (usando 'descompacta.py')
-4. Gera CSV do IPCA-E (encontra o .xls automaticamente)
-5. Gera CSV da SELIC
-6. Executa o cálculo principal ('main.py')
-
-O pipeline para imediatamente se qualquer etapa falhar.
-"""
-
+import os
 import subprocess
 import sys
-from pathlib import Path
+import datetime
 
-def run_command(cmd_list: list[str], title: str):
+# --- CONFIGURAÇÃO GERAL ---
+# O pipeline.py roda na raiz de 'calc-precatorio-tjsp'
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Pastas dos projetos vizinhos (Irmãos)
+CRAWLER_DIR = os.path.abspath(os.path.join(BASE_DIR, "../crawler_tjsp"))
+OCR_DIR = os.path.abspath(os.path.join(BASE_DIR, "../ocr-oficios-tjsp"))
+
+# Diretório de Logs (dentro do projeto atual)
+LOG_DIR = os.path.join(BASE_DIR, "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+
+def log_message(msg):
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{timestamp}] {msg}")
+
+def run_step(step_name, work_dir, script_name, venv_path=None):
     """
-    Executa um comando de subprocesso e para o script em caso de erro.
+    Executa um passo do pipeline em um subprocesso.
     """
-    print("\n" + "="*60)
-    print(f"INICIANDO: {title}")
-    # Converte todos os argumentos para string
-    cmd_list_str = [str(item) for item in cmd_list]
-    print(f"COMANDO: {' '.join(cmd_list_str)}")
-    print("="*60)
+    log_message(f"=== INICIANDO {step_name} ===")
     
+    # Define qual Python usar (do venv ou do sistema)
+    if venv_path:
+        if os.name == 'nt': # Windows
+            python_exe = os.path.join(venv_path, "Scripts", "python.exe")
+        else: # Linux/Mac
+            python_exe = os.path.join(venv_path, "bin", "python")
+        
+        if not os.path.exists(python_exe):
+            log_message(f"[ERRO] Python Venv não encontrado: {python_exe}")
+            return False
+    else:
+        python_exe = sys.executable
+
+    script_path = os.path.join(work_dir, script_name)
+    if not os.path.exists(script_path):
+        log_message(f"[ERRO] Script não encontrado: {script_path}")
+        return False
+
+    # Comando
+    cmd = [python_exe, "-X", "utf8", script_path]
+    
+    # Logs específicos para cada etapa
+    log_file = os.path.join(LOG_DIR, f"{step_name.lower().replace(' ', '_')}.txt")
+
+    # Variáveis de ambiente (Necessário para a Parte 3 funcionar dentro de src)
+    env = os.environ.copy()
+    env["PYTHONPATH"] = work_dir # Adiciona a raiz ao Path
+
     try:
-        # Executa o comando
-        # check=True: levanta um erro se o comando falhar (exit code != 0)
-        # text=True: usa encoding de texto (assume utf-8)
-        subprocess.run(cmd_list_str, check=True, text=True, encoding='utf-8')
+        with open(log_file, "a", encoding="utf-8") as f:
+            # Roda o processo
+            result = subprocess.run(
+                cmd, 
+                cwd=work_dir, # Muda o diretório de trabalho para a pasta do script
+                stdout=f, 
+                stderr=subprocess.STDOUT,
+                env=env, # Passa o ambiente modificado
+                text=True
+            )
         
-        print(f"\n--- SUCESSO: {title} ---")
-        
-    except subprocess.CalledProcessError as e:
-        # Erro de execução (script falhou)
-        print("\n" + "X"*60)
-        print(f"ERRO AO EXECUTAR: {title}")
-        print(f"O COMANDO FALHOU (Código de Saída: {e.returncode})")
-        print(f"Comando: {' '.join(e.cmd)}")
-        print("X"*60)
-        print("\nPipeline interrompido.")
-        sys.exit(1) # Interrompe o pipeline
-        
-    except FileNotFoundError:
-        # Erro (script .py não encontrado ou python não está no PATH)
-        print("\n" + "X"*60)
-        print(f"ERRO: Comando não encontrado: '{cmd_list_str[0]}'")
-        print("Verifique se o Python está no PATH e se o script .py existe no diretório.")
-        print("X"*60)
-        print("\nPipeline interrompido.")
-        sys.exit(1) # Interrompe o pipeline
+        if result.returncode == 0:
+            log_message(f"=== {step_name} CONCLUÍDO (Sucesso) ===")
+            return True
+        else:
+            log_message(f"=== {step_name} FALHOU (Código {result.returncode}) ===")
+            print(f"Verifique o log: {log_file}")
+            return False
+
+    except Exception as e:
+        log_message(f"[ERRO CRÍTICO] Falha ao executar {step_name}: {e}")
+        return False
 
 def main():
-    """Define e executa todas as etapas do pipeline."""
-    
-    # Usa sys.executable para garantir que estamos usando o mesmo
-    # interpretador Python que está executando este pipeline.
-    python_exe = sys.executable
-    
-    # --- 1. Baixar IPCA-E ---
-    cmd_baixar_ipcae = [python_exe, "baixar.py"]
-    run_command(cmd_baixar_ipcae, "1. Baixando arquivo IPCA-E (IBGE)")
-    
-    # --- 2. Baixar SELIC ---
-    cmd_baixar_selic = [python_exe, "baixar_selic.py", "--saida", "selic_mensal.json"]
-    run_command(cmd_baixar_selic, "2. Baixando dados SELIC (BCB)")
-    
-    # --- 3. Descompactar IPCA-E ---
-    # CORRIGIDO: Chamando o nome de ficheiro correto 'descompacta.py'
-    cmd_descompactar = [python_exe, "descompacta.py"]
-    run_command(cmd_descompactar, "3. Descompactando arquivo IPCA-E")
-    
-    # --- 4. Gerar CSV do IPCA-E (com detecção automática) ---
-    print("\n[INFO] Procurando arquivo .xls do IPCA-E em 'ipca-e_SerieHist/'...")
-    xls_dir = Path("ipca-e_SerieHist")
-    if not xls_dir.is_dir():
-        print(f"ERRO: Diretório não encontrado: '{xls_dir.resolve()}'")
-        print("Certifique-se que 'descompacta.py' criou este diretório.")
-        sys.exit(1)
-        
-    # Encontra o primeiro arquivo .xls dentro do diretório
-    xls_files = list(xls_dir.glob("*.xls"))
-    if not xls_files:
-        print(f"ERRO: Nenhum arquivo .xls encontrado em '{xls_dir.resolve()}'")
-        sys.exit(1)
-        
-    ipcae_xls_path = xls_files[0]
-    print(f"[INFO] Arquivo IPCA-E encontrado: {ipcae_xls_path}")
+    log_message(">>> INICIANDO PIPELINE DE AUTOMAÇÃO <<<")
 
-    # Argumentos originais do seu comando
-    cmd_gerar_ipcae = [
-        python_exe, "gerar_indices_csv.py",
-        "--xls", str(ipcae_xls_path),
-        "--sheet", "SÉRIE HISTÓRICA",
-        "--indice", "IPCA-E",
-        "--out", "indices.csv",
-        "--header-row", "3",
-        "--year-col", "ANO",
-        "--month-col", "MÊS",
-        "--var-col", "VARIAÇÃO (%)",
-        "--debug",
-    ]
-    run_command(cmd_gerar_ipcae, "4. Gerando CSV do IPCA-E")
-    
-    # --- 5. Gerar CSV da SELIC ---
-    cmd_gerar_selic = [
-        python_exe, "gerar_selic_csv.py",
-        "--json", "selic_mensal.json",
-        "--out", "indices_selic.csv",
-    ]
-    run_command(cmd_gerar_selic, "5. Gerando CSV da SELIC")
-    
-    # --- 6. Executar Cálculo Principal ---
-    cmd_main = [python_exe, "main.py"]
-    run_command(cmd_main, "6. Executando 'main.py' (Cálculo Principal)")
-    
-    print("\n" + "*"*60)
-    print("PIPELINE DE PRÉ-PROCESSAMENTO CONCLUÍDO COM SUCESSO!")
-    print("*"*60)
+    # --- PARTE 1: CRAWLER ---
+    # Assume que o venv do crawler está dentro da pasta dele
+    if not run_step("1. Crawler TJSP", CRAWLER_DIR, "orchestrator_subprocess.py", os.path.join(CRAWLER_DIR, "env")):
+        return
+
+    # --- PARTE 2: OCR ---
+    # Assume que o venv do OCR está dentro da pasta dele
+    if not run_step("2. OCR TJSP", OCR_DIR, "run_sistema.py", os.path.join(OCR_DIR, "env")):
+        return
+
+    # --- PARTE 3: CÁLCULO (Este Projeto) ---
+    # O script 'main.py' agora está dentro da pasta 'src'
+    # Ajustamos o script_name para 'src/main.py'
+    if not run_step("3. Calculo Precatorio", BASE_DIR, os.path.join("src", "main.py"), os.path.join(BASE_DIR, "env")):
+        return
+
+    log_message(">>> PIPELINE FINALIZADO COM SUCESSO <<<")
 
 if __name__ == "__main__":
     main()
