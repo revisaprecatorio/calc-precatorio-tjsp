@@ -5,7 +5,8 @@ import pandas as pd
 import argparse
 from psycopg2.extras import RealDictCursor
 
-# --- IMPORTS LOCAIS ---
+# --- IMPORTS LOCAIS (TUDO NA RAIZ) ---
+# Certifique-se de que database.py, financial.py e webhook_n8n.py estao na mesma pasta
 from database import get_db_connection
 from financial import carregar_indices_csv, calcular_fim_graca
 from webhook_n8n import enviar_relatorio_precatorio
@@ -14,61 +15,27 @@ from webhook_n8n import enviar_relatorio_precatorio
 DATA_CORTE_EC113 = pd.Timestamp("2021-12-09")
 JUROS_MORA_MENSAL = 0.005 
 
-def registrar_log(cursor, cpf, descricao):
-    """
-    Função auxiliar para gravar logs na tabela public.logs.
-    MODIFICADO: Só grava se o CPF for composto apenas por números.
-    Ignora textos como 'GLOBAL', vazios ou formatações.
-    """
-    # Se for None ou vazio, ignora
-    if not cpf:
-        return
-
-    cpf_str = str(cpf).strip()
-
-    # Validação: Se não for numérico (ex: "GLOBAL" ou "123.456"), não grava.
-    # Isso evita "lixo" na tabela quando o script roda sem filtro específico.
-    if not cpf_str.isdigit():
-        return
-
-    sql_log = """
-        INSERT INTO public.logs (id, cpf, "timestamp", descricao, processo)
-        VALUES(nextval('logs_id_seq'::regclass), %s, CURRENT_TIMESTAMP, %s, 'calculo')
-    """
-    
-    try:
-        cursor.execute(sql_log, (cpf_str, descricao))
-    except Exception as e:
-        print(f"!!! Erro ao gravar log: {e}")
-
 def main():
-    # --- 1. CONFIGURAÇÃO DE ARGUMENTOS ---
+    # --- 1. CONFIGURAÇÃO DE ARGUMENTOS (NOVO) ---
     parser = argparse.ArgumentParser(description="Calculadora de Precatórios TJSP")
     parser.add_argument('--cpf', type=str, help='Filtrar por um CPF específico (apenas números)')
     args = parser.parse_args()
 
     conn = get_db_connection()
     cursor = conn.cursor(cursor_factory=RealDictCursor)
-
-    # Prepara variável de filtro apenas para exibição no print
-    cpf_filtro_display = args.cpf if args.cpf else "GLOBAL"
-    print(f">>> Iniciando execução. Filtro: {cpf_filtro_display}")
     
-    # Tenta gravar log de início (A função registrar_log agora vai barrar se for "GLOBAL" ou formatado)
-    registrar_log(cursor, args.cpf, f"Iniciando script de cálculo. Filtro args: {args.cpf}")
-    conn.commit()
-
     print(">>> Carregando índices financeiros...")
     df_ipca, df_selic = carregar_indices_csv()
 
-    # --- 2. BUSCA PROCESSOS PENDENTES ---
+    # --- 2. BUSCA PROCESSOS PENDENTES (COM JOIN) ---
+    # Query base: Busca detalhes de processos que ainda não foram calculados
     sql_busca = """
         SELECT 
-            e.id as id_esaj,
+            e.id as id_esaj,              -- ID da consulta (pai)
             d.id, 
             d.numero_ordem, 
             d.cpf, 
-            e.email,
+            e.email,                      -- Email da tabela de consultas
             d.numero_processo_cnj, 
             d.valor_total_requisitado AS valor_precatorio,
             d.saldo_final AS principal, 
@@ -82,8 +49,10 @@ def main():
     """
     
     params = []
+    
+    # Se um CPF foi passado pelo orquestrador, filtra a busca
     if args.cpf:
-        # Garante que usamos apenas numeros para o filtro SQL
+        # Remove caracteres não numéricos por segurança
         cpf_limpo = ''.join(filter(str.isdigit, args.cpf))
         print(f">>> Filtrando pelo CPF: {cpf_limpo}")
         sql_busca += " AND d.cpf LIKE %s"
@@ -93,29 +62,19 @@ def main():
     processos = cursor.fetchall()
     
     if not processos:
-        msg = "Nenhum processo pendente encontrado para os critérios informados."
-        print(f">>> {msg}")
-        # Se args.cpf for vazio ou inválido, isso aqui não grava nada no banco, evitando lixo
-        registrar_log(cursor, args.cpf, msg)
-        conn.commit()
+        print(">>> Nenhum processo pendente encontrado para os critérios informados.")
         cursor.close()
         conn.close()
         return
 
-    msg_inicio = f"Iniciando processamento de {len(processos)} registros..."
-    print(f">>> {msg_inicio}")
-    # Aqui também, só grava se args.cpf for numérico válido
-    registrar_log(cursor, args.cpf, msg_inicio)
-    conn.commit()
-
+    print(f">>> Iniciando processamento de {len(processos)} registros...")
     data_hoje = pd.Timestamp.now().replace(day=1)
 
     for row in processos:
         pid = row['id']
         id_esaj = row['id_esaj']
         
-        # Garante CPF limpo (apenas 11 digitos) vindo do banco
-        cpf_raw = str(row['cpf'])[:11] if row['cpf'] else None
+        cpf_raw = str(row['cpf'])[:11] if row['cpf'] else '00000000000'
         proc_num = str(row['numero_processo_cnj'])[:30]
 
         try:
@@ -123,6 +82,7 @@ def main():
             def safe_float(v): return float(v) if v is not None else 0.0
 
             val_principal = safe_float(row['principal'])
+            # Se o saldo final vier zerado, tenta usar o valor total requisitado
             if val_principal == 0: val_principal = safe_float(row['valor_precatorio'])
             
             # Lógica de Proporcionalidade
@@ -152,7 +112,7 @@ def main():
             principal_na_transicao = 0.0
             
             while cursor_data <= data_hoje:
-                # FASE 1: Antes da EC113
+                # FASE 1: Antes da EC113 (Usa IPCA-E + Juros de 0.5% a.m. se fora da graça)
                 if cursor_data < DATA_CORTE_EC113:
                     try: idx = float(df_ipca.loc[cursor_data]['variacao_mensal'])
                     except: idx = 0.0
@@ -166,7 +126,7 @@ def main():
                         meses_com_juros += 1
                     meses_fase1 += 1
                 
-                # FASE 2: Pós EC113
+                # FASE 2: Pós EC113 (Usa SELIC para tudo)
                 else:
                     if principal_na_transicao == 0.0: principal_na_transicao = saldo_principal
                     try: taxa_selic = float(df_selic.loc[cursor_data]['fator_mensal'])
@@ -204,44 +164,31 @@ def main():
             cursor.execute(sql_insert, vals)
             
             # 4. ATUALIZAÇÕES DE STATUS
+            # Marca o processo unitário como calculado para não repetir
             cursor.execute("UPDATE esaj_detalhe_processos SET process_calculo = TRUE WHERE id = %s", (pid,))
             
+            # Atualiza o status global da consulta (Opcional, pois o orchestrator também fará no final,
+            # mas bom manter para tracking em tempo real)
             if id_esaj:
                 cursor.execute(
                     "UPDATE consultas_esaj SET current_state = 'CALCULATION_CONFIRMED', state_updated_at=NOW() WHERE id = %s", 
                     (id_esaj,)
                 )
             
-            # LOG: SUCESSO INDIVIDUAL
-            # Como cpf_raw vem do banco, é numérico, então este log será gravado.
-            log_msg = f"Cálculo efetuado com sucesso. Total: R$ {total_final:,.2f}. Processo: {proc_num}"
-            registrar_log(cursor, cpf_raw, log_msg)
-
-            conn.commit() 
+            conn.commit()
             print(f"   -> [OK] Calculado e Confirmado: R$ {total_final:,.2f}")
 
             # --- 5. WEBHOOK (Notificação) ---
             email_dest = row.get('email')
-            enviado = enviar_relatorio_precatorio(cpf_raw, email_dest)
-            
-            status_envio = "SUCESSO" if enviado else "FALHA"
-            print(f"   -> [WEBHOOK] {status_envio}.")
-            registrar_log(cursor, cpf_raw, f"Webhook disparo: {status_envio} para {email_dest}")
-            conn.commit()
+            if enviar_relatorio_precatorio(cpf_raw, email_dest):
+                print("   -> [WEBHOOK] Enviado com sucesso.")
+            else:
+                print("   -> [WEBHOOK] Falha ao enviar.")
 
         except Exception as e:
-            msg_erro = f"Falha no processo ID {pid}: {e}"
-            print(f"   -> [ERRO] {msg_erro}")
+            print(f"   -> [ERRO] Falha no processo ID {pid}: {e}")
             conn.rollback()
-            
-            # LOG: ERRO
-            registrar_log(cursor, cpf_raw, f"ERRO CRÍTICO: {msg_erro}")
-            conn.commit() 
 
-    # FIM (Sempre tenta registrar, mas se for sem filtro, será ignorado)
-    registrar_log(cursor, args.cpf, "Fim da execução do script.")
-    conn.commit()
-    
     cursor.close()
     conn.close()
     print(">>> FIM DO CÁLCULO <<<")
