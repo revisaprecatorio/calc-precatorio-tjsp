@@ -142,29 +142,12 @@ def main():
 
         try:
             # --- Lógica Financeira ---
-            #principal = safe_float(row["saldo_final"]) or safe_float(row["valor_total_requisitado"])
-            #bruto = safe_float(row["valor_principal_bruto"])
+            principal = safe_float(row["saldo_final"]) or safe_float(row["valor_total_requisitado"])
+            bruto = safe_float(row["valor_principal_bruto"])
             
             # Ratio: Proporção para corrigir os juros base proporcionalmente ao principal líquido
-            #ratio = min(principal / bruto, 1.0) if bruto > 0 else 1.0
-            #juros_base = safe_float(row["juros_moratorios"]) * ratio
-            # DEPOIS (teste definitivo)
-
-
-
-            #principal = safe_float(row["saldo_final"]) or safe_float(row["valor_total_requisitado"])
-            #Ajuste para usar Saldo Final sempre que tiver com valores, caso contratio isa o valor_total_requisitado
-            saldo_final = safe_float(row["saldo_final"])
-            valor_total_requisitado = safe_float(row["valor_total_requisitado"])
-
-            if saldo_final > 0:
-                principal = saldo_final
-            else:
-                principal = valor_total_requisitado
-                     
-                        
-            juros_base = 0.0
-           
+            ratio = min(principal / bruto, 1.0) if bruto > 0 else 1.0
+            juros_base = safe_float(row["juros_moratorios"]) * ratio
 
             dt_req = pd.to_datetime(row["data_base_atualizacao"])
             fim_graca = calcular_fim_graca(dt_req)
@@ -208,8 +191,6 @@ def main():
 
             total = saldo_principal + saldo_juros_base + juros_mora
 
-            total= total * 0.90
-
             # --- [FIX CRÍTICO] LIMPEZA DE VERSÕES ANTERIORES ---
             # Remove cálculo antigo deste processo para evitar duplicidade no relatório final
             cursor.execute(
@@ -230,14 +211,11 @@ def main():
             """, (
                 cpf_raw, proc_num, principal,
                 fator_ipca, fator_selic,
-                (principal_transicao or principal) * 0.90, # Ajustado
-                saldo_principal * 0.90,                     # Ajustado
-                saldo_principal * 0.90,                     # Ajustado
-                saldo_juros_base * 0.90,                    # Ajustado
-                juros_mora * 0.90,                          # Ajustado
-                (saldo_juros_base + juros_mora) * 0.90,     # Ajustado
-                total, # Já ajustado acima
-                meses_juros, meses_antes, meses_pos
+                principal_transicao or principal,
+                saldo_principal, saldo_principal,
+                saldo_juros_base, juros_mora,
+                saldo_juros_base + juros_mora,
+                total, meses_juros, meses_antes, meses_pos
             ))
 
             # Marca o processo como calculado na tabela de detalhes
@@ -260,7 +238,7 @@ def main():
             cpfs_para_notificar[cpf_raw]['ids_esaj_afetados'].add(id_esaj)
 
             registrar_log(cursor, cpf_raw, f"Cálculo concluído: {proc_num} | R$ {total:,.2f}")
-            registrar_log(cursor, cpf_raw, f"Cálculo concluído (com ajuste -10%): {proc_num} | R$ {total:,.2f}")
+            
             # COMMIT IMEDIATO DO CÁLCULO
             # Garante que se o webhook falhar depois, o cálculo já está salvo.
             conn.commit()
@@ -286,29 +264,24 @@ def main():
     
     for cpf_chave, dados in cpfs_para_notificar.items():
         email_dest = dados['email']
-        lista_ids = list(dados['ids_esaj_afetados'])
-        
-        # Inicializa variáveis para evitar NameError
-        sql_ids = None 
+        lista_ids = list(dados['ids_esaj_afetados']) # IDs da tabela consultas_esaj
         
         try:
+            # Chama o webhook APENAS UMA VEZ por CPF
             print(f">>> Enviando webhook único para CPF {cpf_chave}...")
-            registrar_log(cursor, cpf_chave, f"CPF enviado para o Webhook")
-            
-            # Chama a função e captura o booleano + mensagem de erro
-            enviado, detalhe_servidor = enviar_relatorio_precatorio(cpf_chave, email_dest)
+            enviado = enviar_relatorio_precatorio(cpf_chave, email_dest)
             
             status_final = "REPORT_SENT" if enviado else "REPORT_FAILED"
-            msg_log = f"Webhook consolidado: {'SUCESSO' if enviado else 'FALHA'} | Detalhe: {detalhe_servidor}"
+            msg_log = f"Webhook consolidado: {'SUCESSO' if enviado else 'FALHA'}"
             
-            # Monta a string de IDs para o SQL apenas se houver IDs
+            # Atualiza TODOS os jobs (consultas_esaj) desse CPF para o status final de uma vez
             if lista_ids:
+                # Formata tupla para SQL IN: (1, 2) ou (1) se for único
                 if len(lista_ids) == 1:
                     sql_ids = f"({lista_ids[0]})"
                 else:
                     sql_ids = str(tuple(lista_ids))
-
-                # Só executa o UPDATE se sql_ids foi definido com sucesso
+                
                 cursor.execute(f"""
                     UPDATE consultas_esaj 
                     SET current_state=%s, state_updated_at=NOW() 
@@ -316,12 +289,6 @@ def main():
                 """, (status_final,))
                 
             registrar_log(cursor, cpf_chave, msg_log)
-            conn.commit()
-            
-        except Exception as e:
-            if conn: conn.rollback()
-            print(f"[ERRO WEBHOOK] Falha ao notificar CPF {cpf_chave}: {e}")
-            registrar_log(cursor, cpf_chave, f"Erro crítico no fluxo: {str(e)}")
             conn.commit()
             
         except Exception as e:
