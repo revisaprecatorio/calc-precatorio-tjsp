@@ -5,13 +5,17 @@ import pandas as pd
 import argparse
 from psycopg2.extras import RealDictCursor
 
+# --- IMPORTS LOCAIS ---
+# Certifique-se que estes arquivos existem na mesma pasta ou no PYTHONPATH
 from database import get_db_connection
 from financial import carregar_indices_csv, calcular_fim_graca
 from webhook_n8n import enviar_relatorio_precatorio
 
+# =======================
+# CONFIGURAÇÕES GLOBAIS
+# =======================
 DATA_CORTE_EC113 = pd.Timestamp("2021-12-09")
 JUROS_MORA_MENSAL = 0.005
-REDUTOR_FINAL = 0.90
 
 
 def registrar_log(cursor, cpf, descricao):
@@ -19,7 +23,8 @@ def registrar_log(cursor, cpf, descricao):
     if not cpf:
         return
     cpf_str = str(cpf).strip()
-    cpf_limpo = "".join(filter(str.isdigit, cpf_str))
+    # Remove caracteres não numéricos para garantir integridade
+    cpf_limpo = ''.join(filter(str.isdigit, cpf_str))
     if not cpf_limpo:
         return
 
@@ -40,14 +45,12 @@ def safe_float(v):
             return 0.0
         if isinstance(v, pd.Series):
             v = v.iloc[0]
-        if isinstance(v, str):
-            v = v.strip().replace(".", "").replace(",", ".")
         return float(v)
     except Exception:
         return 0.0
 
 
-def safe_index_value(df, idx, col, default=None):
+def safe_index_value(df, idx, col, default=0.0):
     """Busca valor no DataFrame de índices protegendo contra datas inexistentes"""
     try:
         if idx not in df.index:
@@ -58,13 +61,6 @@ def safe_index_value(df, idx, col, default=None):
         return float(val)
     except Exception:
         return default
-
-
-def format_money(v):
-    try:
-        return f"R$ {float(v):,.2f}"
-    except Exception:
-        return f"R$ {v}"
 
 
 def main():
@@ -83,6 +79,8 @@ def main():
     print(">>> Carregando índices financeiros...")
     df_ipca, df_selic = carregar_indices_csv()
 
+    # Query principal: Busca processos que já têm OCR (data_base_atualizacao)
+    # mas ainda não foram calculados (process_calculo IS FALSE/NULL)
     sql = """
         SELECT 
             e.id AS id_esaj,
@@ -98,12 +96,12 @@ def main():
         FROM esaj_detalhe_processos d
         INNER JOIN consultas_esaj e ON e.cpf = d.cpf
         WHERE d.data_base_atualizacao IS NOT NULL
-          AND (d.process_calculo IS FALSE OR d.process_calculo IS NULL)
+        AND (d.process_calculo IS FALSE OR d.process_calculo IS NULL)
     """
 
     params = []
     if args.cpf:
-        cpf_limpo = "".join(filter(str.isdigit, args.cpf))
+        cpf_limpo = ''.join(filter(str.isdigit, args.cpf))
         sql += " AND d.cpf LIKE %s"
         params.append(f"{cpf_limpo}%")
 
@@ -118,25 +116,24 @@ def main():
         conn.close()
         return
 
-    #data_hoje = pd.Timestamp.now().replace(day=1)
-
-    data_hoje_sistema = pd.Timestamp.now().replace(day=1)
-    ultima_data_ipca = df_ipca.index.max()
-    ultima_data_selic = df_selic.index.max()
-
-    data_hoje = min(data_hoje_sistema, ultima_data_ipca, ultima_data_selic)
-
-    print(f">>> Data limite do cálculo: {data_hoje.strftime('%Y-%m')}")
-
+    data_hoje = pd.Timestamp.now().replace(day=1)
+    
+    # Controle para não processar o mesmo ID duas vezes na mesma execução
     processados_ids = set()
+    
+    # DICIONÁRIO PARA AGRUPAR POR CPF (BATCHING)
+    # Estrutura: { '12345678900': {'email': 'x@x.com', 'ids_esaj_afetados': {10, 11}} }
     cpfs_para_notificar = {}
 
     print(f">>> Processando {len(processos)} processos pendentes...")
 
+    # =========================================================================
+    # 1. ETAPA DE CÁLCULO (Itera por Processo)
+    # =========================================================================
     for row in processos:
         pid = row["id"]
         id_esaj = row["id_esaj"]
-        cpf_raw = str(row["cpf"])[:11]
+        cpf_raw = str(row["cpf"])[:11] # Garante CPF limpo
         proc_num = str(row["numero_processo_cnj"])[:30]
 
         if pid in processados_ids:
@@ -144,159 +141,128 @@ def main():
         processados_ids.add(pid)
 
         try:
+            # --- Lógica Financeira ---
+            #principal = safe_float(row["saldo_final"]) or safe_float(row["valor_total_requisitado"])
+            #bruto = safe_float(row["valor_principal_bruto"])
+            
+            # Ratio: Proporção para corrigir os juros base proporcionalmente ao principal líquido
+            #ratio = min(principal / bruto, 1.0) if bruto > 0 else 1.0
+            #juros_base = safe_float(row["juros_moratorios"]) * ratio
+            # DEPOIS (teste definitivo)
+
+
+
+            #principal = safe_float(row["saldo_final"]) or safe_float(row["valor_total_requisitado"])
+            #Ajuste para usar Saldo Final sempre que tiver com valores, caso contratio isa o valor_total_requisitado
             saldo_final = safe_float(row["saldo_final"])
             valor_total_requisitado = safe_float(row["valor_total_requisitado"])
-            valor_principal_bruto = safe_float(row["valor_principal_bruto"])
-            juros_moratorios = safe_float(row["juros_moratorios"])
 
-            # Base principal
             if saldo_final > 0:
                 principal = saldo_final
-                fonte_principal = "saldo_final"
             else:
                 principal = valor_total_requisitado
-                fonte_principal = "valor_total_requisitado"
-
-            # Proporcionaliza juros anteriores ao principal líquido
-            # limitando em 100% para não estourar
-            if valor_principal_bruto > 0 and juros_moratorios > 0:
-                ratio = min(principal / valor_principal_bruto, 1.0)
-                juros_base = juros_moratorios * ratio
-            else:
-                juros_base = juros_moratorios if juros_moratorios > 0 else 0.0
+                     
+                        
+            juros_base = 0.0
+           
 
             dt_req = pd.to_datetime(row["data_base_atualizacao"])
             fim_graca = calcular_fim_graca(dt_req)
 
             cursor_data = dt_req.replace(day=1) + pd.DateOffset(months=1)
-
             saldo_principal = principal
             saldo_juros_base = juros_base
             juros_mora = 0.0
 
             fator_ipca = 1.0
             fator_selic = 1.0
-            meses_antes = 0
-            meses_pos = 0
-            meses_juros = 0
+            meses_antes = meses_pos = meses_juros = 0
             principal_transicao = 0.0
-            juros_base_transicao = 0.0
-            juros_mora_transicao = 0.0
 
+            # Loop Temporal (IPCA-E até Dez/21 -> SELIC após)
             while cursor_data <= data_hoje:
                 if cursor_data < DATA_CORTE_EC113:
-                    idx = safe_index_value(df_ipca, cursor_data, "variacao_mensal", None)
-                    if idx is None:
-                        raise ValueError(f"IPCA ausente para {cursor_data.strftime('%Y-%m')}")
-
+                    # Regra Antiga: IPCA-E + Juros de Mora Simples (0.5%)
+                    idx = safe_index_value(df_ipca, cursor_data, "variacao_mensal", 0.0)
                     fator = 1 + idx
                     fator_ipca *= fator
-
                     saldo_principal *= fator
                     saldo_juros_base *= fator
-
                     if cursor_data > fim_graca:
                         juros_mora += saldo_principal * JUROS_MORA_MENSAL
                         meses_juros += 1
-
                     meses_antes += 1
-
                 else:
+                    # Regra Nova (EC113): SELIC (Engloba Correção + Juros)
                     if principal_transicao == 0:
                         principal_transicao = saldo_principal
-                        juros_base_transicao = saldo_juros_base
-                        juros_mora_transicao = juros_mora
-
-                    taxa = safe_index_value(df_selic, cursor_data, "fator_mensal", None)
-                    if taxa is None:
-                        raise ValueError(f"SELIC ausente para {cursor_data.strftime('%Y-%m')}")
-
+                    taxa = safe_index_value(df_selic, cursor_data, "fator_mensal", 0.008)
                     fator = 1 + taxa
                     fator_selic *= fator
-
                     saldo_principal *= fator
                     saldo_juros_base *= fator
                     juros_mora *= fator
-
                     meses_pos += 1
 
                 cursor_data += pd.DateOffset(months=1)
 
-            total_bruto = saldo_principal + saldo_juros_base + juros_mora
-            total_corrigido = total_bruto * REDUTOR_FINAL
+            total = saldo_principal + saldo_juros_base + juros_mora
 
+            total= total * 0.90
+
+            # --- [FIX CRÍTICO] LIMPEZA DE VERSÕES ANTERIORES ---
+            # Remove cálculo antigo deste processo para evitar duplicidade no relatório final
             cursor.execute(
-                "DELETE FROM esaj_calc_precatorio_resumo WHERE numero_processo_cnj = %s",
+                "DELETE FROM esaj_calc_precatorio_resumo WHERE numero_processo_cnj = %s", 
                 (proc_num,)
             )
 
+            # --- Persistência do Novo Cálculo ---
             cursor.execute("""
                 INSERT INTO esaj_calc_precatorio_resumo (
-                    cpf,
-                    numero_processo_cnj,
-                    principal_original,
-                    fator_ipcae_antes,
-                    fator_ipcae_pos,
-                    principal_apos_antes,
-                    principal_final_ipca_2aa,
-                    principal_final,
-                    juros_mora_anteriores_base,
-                    juros_mora_apos_antes,
-                    juros_mora_final_corrigido,
-                    total_corrigido,
-                    meses_juros,
-                    meses_antes,
-                    meses_pos,
-                    criado_em
+                    cpf, numero_processo_cnj, principal_original,
+                    fator_ipcae_antes, fator_ipcae_pos,
+                    principal_apos_antes, principal_final_ipca_2aa,
+                    principal_final, juros_mora_anteriores_base,
+                    juros_mora_apos_antes, juros_mora_final_corrigido,
+                    total_corrigido, meses_juros, meses_antes, meses_pos, criado_em
                 ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
             """, (
-                cpf_raw,
-                proc_num,
-                principal,                               # sem redutor
-                fator_ipca,
-                fator_selic,
-                (principal_transicao or saldo_principal),# sem redutor
-                saldo_principal,                         # sem redutor
-                saldo_principal,                         # sem redutor
-                juros_base_transicao if principal_transicao > 0 else saldo_juros_base,  # sem redutor
-                juros_mora_transicao if principal_transicao > 0 else juros_mora,         # sem redutor
-                (saldo_juros_base + juros_mora),         # sem redutor
-                total_corrigido,                         # só aqui com 0.90
-                meses_juros,
-                meses_antes,
-                meses_pos
+                cpf_raw, proc_num, principal,
+                fator_ipca, fator_selic,
+                (principal_transicao or principal) * 0.90, # Ajustado
+                saldo_principal * 0.90,                     # Ajustado
+                saldo_principal * 0.90,                     # Ajustado
+                saldo_juros_base * 0.90,                    # Ajustado
+                juros_mora * 0.90,                          # Ajustado
+                (saldo_juros_base + juros_mora) * 0.90,     # Ajustado
+                total, # Já ajustado acima
+                meses_juros, meses_antes, meses_pos
             ))
 
+            # Marca o processo como calculado na tabela de detalhes
+            cursor.execute("UPDATE esaj_detalhe_processos SET process_calculo = TRUE WHERE id=%s", (pid,))
+            
+            # Atualiza status intermediário na tabela de controle (consultas_esaj)
+            # Isso informa ao usuário/sistema que o cálculo matemático foi feito
             cursor.execute(
-                "UPDATE esaj_detalhe_processos SET process_calculo = TRUE WHERE id=%s",
-                (pid,)
-            )
-
-            cursor.execute(
-                "UPDATE consultas_esaj SET current_state='CALCULATION_DONE', state_updated_at=NOW() WHERE id=%s",
+                "UPDATE consultas_esaj SET current_state='CALCULATION_DONE', state_updated_at=NOW() WHERE id=%s", 
                 (id_esaj,)
             )
 
+            # --- AGRUPAMENTO (Batching) ---
+            # Não envia e-mail agora. Guarda na lista para enviar 1 por CPF no final.
             if cpf_raw not in cpfs_para_notificar:
                 cpfs_para_notificar[cpf_raw] = {
-                    "email": row.get("email"),
-                    "ids_esaj_afetados": set()
+                    'email': row.get("email"),
+                    'ids_esaj_afetados': set()
                 }
-            cpfs_para_notificar[cpf_raw]["ids_esaj_afetados"].add(id_esaj)
+            cpfs_para_notificar[cpf_raw]['ids_esaj_afetados'].add(id_esaj)
 
-            registrar_log(
-                cursor,
-                cpf_raw,
-                (
-                    f"Cálculo concluído: {proc_num} | "
-                    f"fonte_principal={fonte_principal} | "
-                    f"principal={format_money(principal)} | "
-                    f"juros_base={format_money(juros_base)} | "
-                    f"total_bruto={format_money(total_bruto)} | "
-                    f"total_corrigido={format_money(total_corrigido)}"
-                )
-            )
-
+            registrar_log(cursor, cpf_raw, f"Cálculo concluído: {proc_num} | R$ {total:,.2f}")
+            registrar_log(cursor, cpf_raw, f"Cálculo concluído (com ajuste -10%): {proc_num} | R$ {total:,.2f}")
+            # COMMIT IMEDIATO DO CÁLCULO
+            # Garante que se o webhook falhar depois, o cálculo já está salvo.
             conn.commit()
 
         except Exception as e:
@@ -304,54 +270,64 @@ def main():
             msg = f"Erro ao calcular processo {proc_num}: {e}"
             print(f"[ERRO] {msg}")
             registrar_log(cursor, cpf_raw, msg)
-
+            
+            # Tenta marcar erro na tabela de controle (nova transação isolada)
             try:
-                cursor.execute(
-                    "UPDATE consultas_esaj SET current_state='CALC_ERROR' WHERE id=%s",
-                    (id_esaj,)
-                )
+                cursor.execute("UPDATE consultas_esaj SET current_state='CALC_ERROR' WHERE id=%s", (id_esaj,))
                 conn.commit()
-            except Exception:
+            except:
                 pass
 
+    # =========================================================================
+    # 2. ETAPA DE NOTIFICAÇÃO CONSOLIDADA (Itera por CPF)
+    # =========================================================================
     if cpfs_para_notificar:
         print(f">>> Iniciando envio de notificações consolidadas para {len(cpfs_para_notificar)} CPF(s)...")
-
+    
     for cpf_chave, dados in cpfs_para_notificar.items():
-        email_dest = dados["email"]
-        lista_ids = list(dados["ids_esaj_afetados"])
-        sql_ids = None
-
+        email_dest = dados['email']
+        lista_ids = list(dados['ids_esaj_afetados'])
+        
+        # Inicializa variáveis para evitar NameError
+        sql_ids = None 
+        
         try:
             print(f">>> Enviando webhook único para CPF {cpf_chave}...")
-            registrar_log(cursor, cpf_chave, "CPF enviado para o Webhook")
-
+            registrar_log(cursor, cpf_chave, f"CPF enviado para o Webhook")
+            
+            # Chama a função e captura o booleano + mensagem de erro
             enviado, detalhe_servidor = enviar_relatorio_precatorio(cpf_chave, email_dest)
-
+            
             status_final = "REPORT_SENT" if enviado else "REPORT_FAILED"
             msg_log = f"Webhook consolidado: {'SUCESSO' if enviado else 'FALHA'} | Detalhe: {detalhe_servidor}"
-
+            
+            # Monta a string de IDs para o SQL apenas se houver IDs
             if lista_ids:
                 if len(lista_ids) == 1:
                     sql_ids = f"({lista_ids[0]})"
                 else:
                     sql_ids = str(tuple(lista_ids))
 
+                # Só executa o UPDATE se sql_ids foi definido com sucesso
                 cursor.execute(f"""
-                    UPDATE consultas_esaj
-                    SET current_state=%s, state_updated_at=NOW()
+                    UPDATE consultas_esaj 
+                    SET current_state=%s, state_updated_at=NOW() 
                     WHERE id IN {sql_ids}
                 """, (status_final,))
-
+                
             registrar_log(cursor, cpf_chave, msg_log)
             conn.commit()
-
+            
         except Exception as e:
-            if conn:
-                conn.rollback()
+            if conn: conn.rollback()
             print(f"[ERRO WEBHOOK] Falha ao notificar CPF {cpf_chave}: {e}")
             registrar_log(cursor, cpf_chave, f"Erro crítico no fluxo: {str(e)}")
             conn.commit()
+            
+        except Exception as e:
+            conn.rollback()
+            print(f"[ERRO WEBHOOK] Falha ao notificar CPF {cpf_chave}: {e}")
+            registrar_log(cursor, cpf_chave, f"Erro webhook consolidado: {e}")
 
     registrar_log(cursor, args.cpf, "Fim execução script cálculo")
     conn.commit()

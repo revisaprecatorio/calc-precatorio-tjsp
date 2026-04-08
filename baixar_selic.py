@@ -18,6 +18,7 @@ from pathlib import Path
 from datetime import date
 import requests
 from time import sleep
+from datetime import datetime
 
 # URL da API do BCB-SGS para a série 1178 (SELIC acumulada no mês)
 API_URL = "https://api.bcb.gov.br/dados/serie/bcdata.sgs.1178/dados"
