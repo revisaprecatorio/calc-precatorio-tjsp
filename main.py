@@ -11,6 +11,9 @@ from webhook_n8n import enviar_relatorio_precatorio
 
 DATA_CORTE_EC113 = pd.Timestamp("2021-12-09")
 JUROS_MORA_MENSAL = 0.005
+
+# LIGA / DESLIGA DO REDUTOR FINAL
+APLICAR_REDUTOR_FINAL = False
 REDUTOR_FINAL = 0.90
 
 
@@ -125,6 +128,7 @@ def main():
     data_hoje = min(data_hoje_sistema, ultima_data_ipca, ultima_data_selic)
 
     print(f">>> Data limite do cálculo: {data_hoje.strftime('%Y-%m')}")
+    print(f">>> Aplicar redutor final: {'SIM' if APLICAR_REDUTOR_FINAL else 'NÃO'}")
 
     processados_ids = set()
     cpfs_para_notificar = {}
@@ -232,7 +236,11 @@ def main():
                 cursor_data += pd.DateOffset(months=1)
 
             total_bruto = saldo_principal + saldo_juros_base + juros_mora
-            total_corrigido = total_bruto * REDUTOR_FINAL
+
+            if APLICAR_REDUTOR_FINAL:
+                total_corrigido = total_bruto * REDUTOR_FINAL
+            else:
+                total_corrigido = total_bruto
 
             cursor.execute(
                 "DELETE FROM esaj_calc_precatorio_resumo WHERE numero_processo_cnj = %s",
@@ -261,16 +269,16 @@ def main():
             """, (
                 cpf_raw,
                 proc_num,
-                principal,                    # sem redutor
+                principal,
                 fator_ipca,
                 fator_selic,
-                principal_apos_antes,         # sem redutor
-                saldo_principal,              # sem redutor
-                saldo_principal,              # sem redutor
-                juros_base_apos_antes,        # sem redutor
-                juros_mora_apos_antes,        # sem redutor
-                (saldo_juros_base + juros_mora),  # sem redutor
-                total_corrigido,              # só aqui com 0.90
+                principal_apos_antes,
+                saldo_principal,
+                saldo_principal,
+                juros_base_apos_antes,
+                juros_mora_apos_antes,
+                (saldo_juros_base + juros_mora),
+                total_corrigido,
                 meses_juros,
                 meses_antes,
                 meses_pos
@@ -305,6 +313,7 @@ def main():
                     f"juros_base_apos_antes={format_money(juros_base_apos_antes)} | "
                     f"juros_mora_apos_antes={format_money(juros_mora_apos_antes)} | "
                     f"total_bruto={format_money(total_bruto)} | "
+                    f"redutor_aplicado={'SIM' if APLICAR_REDUTOR_FINAL else 'NÃO'} | "
                     f"total_corrigido={format_money(total_corrigido)}"
                 )
             )
