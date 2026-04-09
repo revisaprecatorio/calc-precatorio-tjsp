@@ -118,8 +118,6 @@ def main():
         conn.close()
         return
 
-    #data_hoje = pd.Timestamp.now().replace(day=1)
-
     data_hoje_sistema = pd.Timestamp.now().replace(day=1)
     ultima_data_ipca = df_ipca.index.max()
     ultima_data_selic = df_selic.index.max()
@@ -149,7 +147,6 @@ def main():
             valor_principal_bruto = safe_float(row["valor_principal_bruto"])
             juros_moratorios = safe_float(row["juros_moratorios"])
 
-            # Base principal
             if saldo_final > 0:
                 principal = saldo_final
                 fonte_principal = "saldo_final"
@@ -157,8 +154,6 @@ def main():
                 principal = valor_total_requisitado
                 fonte_principal = "valor_total_requisitado"
 
-            # Proporcionaliza juros anteriores ao principal líquido
-            # limitando em 100% para não estourar
             if valor_principal_bruto > 0 and juros_moratorios > 0:
                 ratio = min(principal / valor_principal_bruto, 1.0)
                 juros_base = juros_moratorios * ratio
@@ -166,8 +161,13 @@ def main():
                 juros_base = juros_moratorios if juros_moratorios > 0 else 0.0
 
             dt_req = pd.to_datetime(row["data_base_atualizacao"])
-            fim_graca = calcular_fim_graca(dt_req)
 
+            if dt_req > data_hoje:
+                raise ValueError(
+                    f"data_base_atualizacao futura para o processo: {dt_req.strftime('%Y-%m-%d')}"
+                )
+
+            fim_graca = calcular_fim_graca(dt_req)
             cursor_data = dt_req.replace(day=1) + pd.DateOffset(months=1)
 
             saldo_principal = principal
@@ -179,9 +179,14 @@ def main():
             meses_antes = 0
             meses_pos = 0
             meses_juros = 0
-            principal_transicao = 0.0
-            juros_base_transicao = 0.0
-            juros_mora_transicao = 0.0
+
+            principal_transicao = None
+            juros_base_transicao = None
+            juros_mora_transicao = None
+
+            principal_apos_antes = principal
+            juros_base_apos_antes = juros_base
+            juros_mora_apos_antes = 0.0
 
             while cursor_data <= data_hoje:
                 if cursor_data < DATA_CORTE_EC113:
@@ -202,10 +207,14 @@ def main():
                     meses_antes += 1
 
                 else:
-                    if principal_transicao == 0:
+                    if principal_transicao is None:
                         principal_transicao = saldo_principal
                         juros_base_transicao = saldo_juros_base
                         juros_mora_transicao = juros_mora
+
+                        principal_apos_antes = saldo_principal
+                        juros_base_apos_antes = saldo_juros_base
+                        juros_mora_apos_antes = juros_mora
 
                     taxa = safe_index_value(df_selic, cursor_data, "fator_mensal", None)
                     if taxa is None:
@@ -252,16 +261,16 @@ def main():
             """, (
                 cpf_raw,
                 proc_num,
-                principal,                               # sem redutor
+                principal,                    # sem redutor
                 fator_ipca,
                 fator_selic,
-                (principal_transicao or saldo_principal),# sem redutor
-                saldo_principal,                         # sem redutor
-                saldo_principal,                         # sem redutor
-                juros_base_transicao if principal_transicao > 0 else saldo_juros_base,  # sem redutor
-                juros_mora_transicao if principal_transicao > 0 else juros_mora,         # sem redutor
-                (saldo_juros_base + juros_mora),         # sem redutor
-                total_corrigido,                         # só aqui com 0.90
+                principal_apos_antes,         # sem redutor
+                saldo_principal,              # sem redutor
+                saldo_principal,              # sem redutor
+                juros_base_apos_antes,        # sem redutor
+                juros_mora_apos_antes,        # sem redutor
+                (saldo_juros_base + juros_mora),  # sem redutor
+                total_corrigido,              # só aqui com 0.90
                 meses_juros,
                 meses_antes,
                 meses_pos
@@ -292,6 +301,9 @@ def main():
                     f"fonte_principal={fonte_principal} | "
                     f"principal={format_money(principal)} | "
                     f"juros_base={format_money(juros_base)} | "
+                    f"principal_apos_antes={format_money(principal_apos_antes)} | "
+                    f"juros_base_apos_antes={format_money(juros_base_apos_antes)} | "
+                    f"juros_mora_apos_antes={format_money(juros_mora_apos_antes)} | "
                     f"total_bruto={format_money(total_bruto)} | "
                     f"total_corrigido={format_money(total_corrigido)}"
                 )
