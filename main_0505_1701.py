@@ -1,4 +1,6 @@
 from __future__ import annotations
+import sys
+import os
 import pandas as pd
 import argparse
 from psycopg2.extras import RealDictCursor
@@ -10,17 +12,17 @@ from webhook_n8n import enviar_relatorio_precatorio
 DATA_CORTE_EC113 = pd.Timestamp("2021-12-09")
 JUROS_MORA_MENSAL = 0.005
 
+# LIGA / DESLIGA DO REDUTOR FINAL
 APLICAR_REDUTOR_FINAL = False
 REDUTOR_FINAL = 0.90
 
 
 def registrar_log(cursor, cpf, descricao):
+    """Grava logs operacionais no banco de dados"""
     if not cpf:
         return
-
     cpf_str = str(cpf).strip()
     cpf_limpo = "".join(filter(str.isdigit, cpf_str))
-
     if not cpf_limpo:
         return
 
@@ -28,7 +30,6 @@ def registrar_log(cursor, cpf, descricao):
         INSERT INTO public.logs (id, cpf, "timestamp", descricao, processo)
         VALUES(nextval('logs_id_seq'::regclass), %s, CURRENT_TIMESTAMP, %s, 'calculo')
     """
-
     try:
         cursor.execute(sql, (cpf_limpo, descricao))
     except Exception as e:
@@ -36,6 +37,7 @@ def registrar_log(cursor, cpf, descricao):
 
 
 def safe_float(v):
+    """Converte valores sujos (None, Series, Strings) para float seguro"""
     try:
         if v is None:
             return 0.0
@@ -49,6 +51,7 @@ def safe_float(v):
 
 
 def safe_index_value(df, idx, col, default=None):
+    """Busca valor no DataFrame de índices protegendo contra datas inexistentes"""
     try:
         if idx not in df.index:
             return default
@@ -94,20 +97,14 @@ def main():
             d.saldo_final,
             d.valor_principal_bruto,
             d.data_base_atualizacao,
-            d.data_saldo_final,
             d.juros_moratorios
         FROM esaj_detalhe_processos d
         INNER JOIN consultas_esaj e ON e.cpf = d.cpf
-        WHERE (
-                d.data_base_atualizacao IS NOT NULL
-                OR d.data_saldo_final IS NOT NULL
-              )
+        WHERE d.data_base_atualizacao IS NOT NULL
           AND (d.process_calculo IS FALSE OR d.process_calculo IS NULL)
-          AND rejeitado=false
     """
 
     params = []
-
     if args.cpf:
         cpf_limpo = "".join(filter(str.isdigit, args.cpf))
         sql += " AND d.cpf LIKE %s"
@@ -146,44 +143,32 @@ def main():
 
         if pid in processados_ids:
             continue
-
         processados_ids.add(pid)
 
         try:
             saldo_final = safe_float(row["saldo_final"])
             valor_total_requisitado = safe_float(row["valor_total_requisitado"])
+            valor_principal_bruto = safe_float(row["valor_principal_bruto"])
             juros_moratorios = safe_float(row["juros_moratorios"])
 
             if saldo_final > 0:
                 principal = saldo_final
-                juros_base = 0.0
-                fonte_principal = "saldo_final_apos_pagamento"
-
-                if row.get("data_saldo_final"):
-                    dt_req = pd.to_datetime(row["data_saldo_final"])
-                    fonte_data = "data_saldo_final"
-                else:
-                    raise ValueError(
-                        "saldo_final informado, mas data_saldo_final está vazia. "
-                        "Não é seguro calcular usando data_base_atualizacao antiga."
-                    )
-
+                fonte_principal = "saldo_final"
             else:
                 principal = valor_total_requisitado
-                juros_base = juros_moratorios if juros_moratorios > 0 else 0.0
                 fonte_principal = "valor_total_requisitado"
 
-                if row.get("data_base_atualizacao"):
-                    dt_req = pd.to_datetime(row["data_base_atualizacao"])
-                    fonte_data = "data_base_atualizacao"
-                else:
-                    raise ValueError(
-                        "valor_total_requisitado usado, mas data_base_atualizacao está vazia."
-                    )
+            if valor_principal_bruto > 0 and juros_moratorios > 0:
+                ratio = min(principal / valor_principal_bruto, 1.0)
+                juros_base = juros_moratorios * ratio
+            else:
+                juros_base = juros_moratorios if juros_moratorios > 0 else 0.0
+
+            dt_req = pd.to_datetime(row["data_base_atualizacao"])
 
             if dt_req > data_hoje:
                 raise ValueError(
-                    f"{fonte_data} futura para o processo: {dt_req.strftime('%Y-%m-%d')}"
+                    f"data_base_atualizacao futura para o processo: {dt_req.strftime('%Y-%m-%d')}"
                 )
 
             fim_graca = calcular_fim_graca(dt_req)
@@ -200,6 +185,8 @@ def main():
             meses_juros = 0
 
             principal_transicao = None
+            juros_base_transicao = None
+            juros_mora_transicao = None
 
             principal_apos_antes = principal
             juros_base_apos_antes = juros_base
@@ -208,7 +195,6 @@ def main():
             while cursor_data <= data_hoje:
                 if cursor_data < DATA_CORTE_EC113:
                     idx = safe_index_value(df_ipca, cursor_data, "variacao_mensal", None)
-
                     if idx is None:
                         raise ValueError(f"IPCA ausente para {cursor_data.strftime('%Y-%m')}")
 
@@ -227,12 +213,14 @@ def main():
                 else:
                     if principal_transicao is None:
                         principal_transicao = saldo_principal
+                        juros_base_transicao = saldo_juros_base
+                        juros_mora_transicao = juros_mora
+
                         principal_apos_antes = saldo_principal
                         juros_base_apos_antes = saldo_juros_base
                         juros_mora_apos_antes = juros_mora
 
                     taxa = safe_index_value(df_selic, cursor_data, "fator_mensal", None)
-
                     if taxa is None:
                         raise ValueError(f"SELIC ausente para {cursor_data.strftime('%Y-%m')}")
 
@@ -289,7 +277,7 @@ def main():
                 saldo_principal,
                 juros_base_apos_antes,
                 juros_mora_apos_antes,
-                saldo_juros_base + juros_mora,
+                (saldo_juros_base + juros_mora),
                 total_corrigido,
                 meses_juros,
                 meses_antes,
@@ -302,12 +290,7 @@ def main():
             )
 
             cursor.execute(
-                """
-                UPDATE consultas_esaj
-                SET current_state='CALCULATION_DONE',
-                    state_updated_at=NOW()
-                WHERE id=%s
-                """,
+                "UPDATE consultas_esaj SET current_state='CALCULATION_DONE', state_updated_at=NOW() WHERE id=%s",
                 (id_esaj,)
             )
 
@@ -316,7 +299,6 @@ def main():
                     "email": row.get("email"),
                     "ids_esaj_afetados": set()
                 }
-
             cpfs_para_notificar[cpf_raw]["ids_esaj_afetados"].add(id_esaj)
 
             registrar_log(
@@ -325,8 +307,6 @@ def main():
                 (
                     f"Cálculo concluído: {proc_num} | "
                     f"fonte_principal={fonte_principal} | "
-                    f"fonte_data={fonte_data} | "
-                    f"dt_req={dt_req.strftime('%Y-%m-%d')} | "
                     f"principal={format_money(principal)} | "
                     f"juros_base={format_money(juros_base)} | "
                     f"principal_apos_antes={format_money(principal_apos_antes)} | "
@@ -380,8 +360,7 @@ def main():
 
                 cursor.execute(f"""
                     UPDATE consultas_esaj
-                    SET current_state=%s,
-                        state_updated_at=NOW()
+                    SET current_state=%s, state_updated_at=NOW()
                     WHERE id IN {sql_ids}
                 """, (status_final,))
 
@@ -391,7 +370,6 @@ def main():
         except Exception as e:
             if conn:
                 conn.rollback()
-
             print(f"[ERRO WEBHOOK] Falha ao notificar CPF {cpf_chave}: {e}")
             registrar_log(cursor, cpf_chave, f"Erro crítico no fluxo: {str(e)}")
             conn.commit()
@@ -400,7 +378,6 @@ def main():
     conn.commit()
     cursor.close()
     conn.close()
-
     print(">>> FIM DO CÁLCULO <<<")
 
 
